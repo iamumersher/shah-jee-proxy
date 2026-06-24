@@ -355,3 +355,17 @@ app.listen(PORT, () => {
 Anthropic API Key: ${process.env.ANTHROPIC_API_KEY ? "✅ Loaded" : "❌ Missing — add to .env"}
   `);
 });
+app.get("/weex/dns-test", async (_, res) => {
+  const dns = require("dns").promises;
+  const domains = [
+    "api.weex.com","openapi.weex.com","www.weex.com",
+    "api.weexgo.com","trade.weex.com","global.weex.com",
+    "api2.weex.com","api-v2.weex.com","api.weex.io"
+  ];
+  const results = {};
+  for (const d of domains) {
+    try { results[d] = await dns.lookup(d); }
+    catch(e) { results[d] = "FAILED: " + e.message; }
+  }
+  res.json(results);
+});
