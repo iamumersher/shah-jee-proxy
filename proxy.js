@@ -10,7 +10,8 @@ const https   = require("https");
 const crypto  = require("crypto");
 
 const app  = express();
-const PORT = process.env.PORT || 4000;
+const PORT = 4000;
+
 app.use(cors({ origin: "*" }));
 app.use(express.json());
 
@@ -136,12 +137,12 @@ app.post("/weex/balance", async (req, res) => {
 
   // All possible spot endpoint + domain combinations
   const spotCombos = [
-    { domain: "api.weex.com",      path: "/api/v1/account/balance" },
-    { domain: "api.weex.com",      path: "/api/v1/account/assets" },
-    { domain: "api.weex.com",      path: "/api/spot/v1/account/balance" },
-    { domain: "openapi.weex.com",  path: "/api/v1/account/balance" },
-    { domain: "openapi.weex.com",  path: "/spot/v1/account/balance" },
-    { domain: "api.weexapi.com",   path: "/api/v1/account/balance" },
+    { domain: "www.weex.com", path: "/api/v1/account/balance" },
+    { domain: "www.weex.com", path: "/api/spot/v1/account/balance" },
+    { domain: "www.weex.com", path: "/spot/v1/account/balance" },
+    { domain: "www.weex.com", path: "/api/v1/account/assets" },
+    { domain: "www.weex.com", path: "/api/user/v1/account/balance" },
+    { domain: "www.weex.com", path: "/api/v2/account/balance" },
   ];
 
   let spotDone = false;
@@ -204,11 +205,11 @@ app.post("/weex/balance", async (req, res) => {
 
   // Futures endpoints
   const futuresCombos = [
-    { domain: "api.weex.com",     path: "/api/v1/contract/account/balance" },
-    { domain: "api.weex.com",     path: "/api/mix/v1/account/accounts?productType=umcbl" },
-    { domain: "api.weex.com",     path: "/api/v1/future/account" },
-    { domain: "openapi.weex.com", path: "/api/v1/contract/account/balance" },
-    { domain: "openapi.weex.com", path: "/mix/v1/account/accounts?productType=umcbl" },
+    { domain: "www.weex.com", path: "/api/v1/contract/account/balance" },
+    { domain: "www.weex.com", path: "/api/mix/v1/account/accounts?productType=umcbl" },
+    { domain: "www.weex.com", path: "/api/v1/future/account" },
+    { domain: "www.weex.com", path: "/mix/v1/account/accounts?productType=umcbl" },
+    { domain: "www.weex.com", path: "/api/v2/contract/account/balance" },
   ];
 
   let futuresDone = false;
@@ -287,17 +288,7 @@ app.post("/weex/order", async (req, res) => {
 
   try {
     const r = await httpsRequest({
-      hostname: "api.weex.com",
-      path,
-      method:   "POST",
-      headers: {
-        "Content-Type":   "application/json",
-        "Content-Length": Buffer.byteLength(bodyStr),
-        "X-API-KEY":      key,
-        "X-TIMESTAMP":    ts,
-        "X-SIGNATURE":    sig,
-      },
-    }, bodyStr);
+      hostname: "www.weex.com",
 
     const d = r.data;
     if (d.code && d.code !== "00000" && d.code !== 0) throw new Error(d.msg || JSON.stringify(d));
@@ -354,18 +345,4 @@ app.listen(PORT, () => {
 
 Anthropic API Key: ${process.env.ANTHROPIC_API_KEY ? "✅ Loaded" : "❌ Missing — add to .env"}
   `);
-});
-app.get("/weex/dns-test", async (_, res) => {
-  const dns = require("dns").promises;
-  const domains = [
-    "api.weex.com","openapi.weex.com","www.weex.com",
-    "api.weexgo.com","trade.weex.com","global.weex.com",
-    "api2.weex.com","api-v2.weex.com","api.weex.io"
-  ];
-  const results = {};
-  for (const d of domains) {
-    try { results[d] = await dns.lookup(d); }
-    catch(e) { results[d] = "FAILED: " + e.message; }
-  }
-  res.json(results);
 });
