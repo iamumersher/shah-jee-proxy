@@ -134,16 +134,8 @@ app.post("/weex/balance", async (req, res) => {
 
   // All endpoint combinations to try with both V3 and V1 signature
   const combos = [
-    // V3 endpoints (api-spot.weex.com)
-    { domain: "api-spot.weex.com", path: "/api/v3/account/balance",       version: "v3" },
-    { domain: "api-spot.weex.com", path: "/api/v3/account",               version: "v3" },
-    { domain: "api-spot.weex.com", path: "/api/v3/account/information",   version: "v3" },
-    { domain: "api-spot.weex.com", path: "/api/v3/asset/balance",         version: "v3" },
-    { domain: "api-spot.weex.com", path: "/api/v3/account/assets",        version: "v3" },
-    // V1 endpoints
-    { domain: "api-spot.weex.com", path: "/api/v1/account/balance",       version: "v1" },
-    { domain: "api-spot.weex.com", path: "/api/v1/account/assets",        version: "v1" },
-    { domain: "www.weex.com",      path: "/api/v3/account/balance",       version: "v3" },
+    // THIS WORKS - confirmed HTTP200
+    { domain: "api-spot.weex.com", path: "/api/v3/account", version: "v3" },
   ];
 
   let spotDone = false;
@@ -178,28 +170,29 @@ app.post("/weex/balance", async (req, res) => {
       if (r.status === 200 && r.body.includes("{")) {
         try {
           const d = JSON.parse(r.body);
-          const ok = d.code === "00000" || d.code === 0 || d.code === "0" || d.success === true || d.data;
-          if (ok) {
-            let list = [];
-            if (Array.isArray(d.data))        list = d.data;
-            else if (Array.isArray(d.result)) list = d.result;
-            else if (Array.isArray(d.list))   list = d.list;
-            else if (d.data && typeof d.data === "object") {
-              list = Object.entries(d.data).map(([k, v]) => ({ coinName: k, ...v }));
+          // /api/v3/account returns balances array directly
+          let list = [];
+          if (Array.isArray(d.balances))    list = d.balances;
+          else if (Array.isArray(d.data))   list = d.data;
+          else if (Array.isArray(d.result)) list = d.result;
+          else if (Array.isArray(d.list))   list = d.list;
+          else if (d.data && typeof d.data === "object") {
+            list = Object.entries(d.data).map(([k, v]) => ({ coinName: k, ...v }));
+          }
+          for (const a of list) {
+            const sym = (a.asset || a.coinName || a.currency || a.coin || "").toUpperCase();
+            if (["USDT","BTC","ETH","SOL","BNB"].includes(sym)) {
+              result.spot[sym] = {
+                available: parseFloat(a.free || a.available || a.availableBalance || 0).toFixed(sym === "USDT" ? 2 : 8),
+                locked:    parseFloat(a.locked || a.freeze || a.used || 0).toFixed(sym === "USDT" ? 2 : 8),
+              };
             }
-            for (const a of list) {
-              const sym = (a.coinName || a.currency || a.asset || a.coin || "").toUpperCase();
-              if (["USDT","BTC","ETH","SOL","BNB"].includes(sym)) {
-                result.spot[sym] = {
-                  available: parseFloat(a.available || a.availableBalance || a.free || a.balance || 0).toFixed(sym === "USDT" ? 2 : 8),
-                  locked:    parseFloat(a.locked    || a.freeze || a.used  || 0).toFixed(sym === "USDT" ? 2 : 8),
-                };
-              }
-            }
-            if (Object.keys(result.spot).length > 0) {
-              console.log("[Spot] ✅ Parsed:", result.spot);
-              spotDone = true;
-            }
+          }
+          if (Object.keys(result.spot).length > 0) {
+            console.log("[Spot] ✅ Parsed:", result.spot);
+            spotDone = true;
+          } else {
+            console.log("[Spot] Response parsed but no matching assets. Full response:", r.body.slice(0, 500));
           }
         } catch(pe) { console.warn("Parse error:", pe.message); }
       }
