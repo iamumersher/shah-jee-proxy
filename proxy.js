@@ -1,8 +1,3 @@
-/**
- * proxy.js — Shah Jee Trading Bot
- * Fixed: Weex spot + futures balance with correct API format
- */
-
 require("dotenv").config();
 const express = require("express");
 const cors    = require("cors");
@@ -10,17 +5,15 @@ const https   = require("https");
 const crypto  = require("crypto");
 
 const app  = express();
-const PORT = 4000;
+const PORT = process.env.PORT || 4000;
 
 app.use(cors({ origin: "*" }));
 app.use(express.json());
 
-// ── HTTPS helper ───────────────────────────────────────────────────────────────
+// ── HTTPS helpers ─────────────────────────────────────────────────────────────
 function httpsGet(url) {
   return new Promise((resolve, reject) => {
-    https.get(url, {
-      headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" }
-    }, (res) => {
+    https.get(url, { headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" } }, (res) => {
       let data = "";
       res.on("data", c => data += c);
       res.on("end", () => {
@@ -31,7 +24,7 @@ function httpsGet(url) {
   });
 }
 
-function httpsRequest(options, body = null) {
+function httpsRequest(options, body) {
   return new Promise((resolve, reject) => {
     const req = https.request(options, (res) => {
       let data = "";
@@ -47,20 +40,19 @@ function httpsRequest(options, body = null) {
   });
 }
 
-// ── Weex Signature ─────────────────────────────────────────────────────────────
-// Weex uses: HMAC-SHA256( timestamp + "GET" + path + queryString )
-// or for POST: HMAC-SHA256( timestamp + "POST" + path + body )
-function weexSign(secret, timestamp, method, path, payload = "") {
-  const prehash = timestamp + method.toUpperCase() + path + payload;
+// ── Weex signature ────────────────────────────────────────────────────────────
+function weexSign(secret, timestamp, method, path, payload) {
+  const prehash = timestamp + method.toUpperCase() + path + (payload || "");
   return crypto.createHmac("sha256", secret).update(prehash).digest("hex");
 }
 
-// ── GET /health ────────────────────────────────────────────────────────────────
-app.get("/health", (_, res) => res.json({ ok: true, ts: Date.now() }));
+// ── GET /health ───────────────────────────────────────────────────────────────
+app.get("/health", (_, res) => {
+  res.json({ ok: true, ts: Date.now() });
+});
 
-// ── GET /prices ────────────────────────────────────────────────────────────────
+// ── GET /prices ───────────────────────────────────────────────────────────────
 app.get("/prices", async (_, res) => {
-  // Binance (most reliable)
   try {
     const [a, b, c] = await Promise.all([
       httpsGet("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"),
@@ -69,17 +61,16 @@ app.get("/prices", async (_, res) => {
     ]);
     const btc = parseFloat(a.price), eth = parseFloat(b.price), sol = parseFloat(c.price);
     if (btc > 0 && eth > 0 && sol > 0) {
-      console.log(`[Prices] Binance ✅ BTC=$${btc} ETH=$${eth} SOL=$${sol}`);
+      console.log(`[Prices] Binance BTC=$${btc} ETH=$${eth} SOL=$${sol}`);
       return res.json({ BTC: btc, ETH: eth, SOL: sol, source: "Binance" });
     }
   } catch(e) { console.warn("[Prices] Binance failed:", e.message); }
 
-  // CoinGecko fallback
   try {
     const d = await httpsGet("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana&vs_currencies=usd");
-    const btc = d?.bitcoin?.usd, eth = d?.ethereum?.usd, sol = d?.solana?.usd;
+    const btc = d.bitcoin?.usd, eth = d.ethereum?.usd, sol = d.solana?.usd;
     if (btc > 0 && eth > 0 && sol > 0) {
-      console.log(`[Prices] CoinGecko ✅ BTC=$${btc}`);
+      console.log(`[Prices] CoinGecko BTC=$${btc}`);
       return res.json({ BTC: btc, ETH: eth, SOL: sol, source: "CoinGecko" });
     }
   } catch(e) { console.warn("[Prices] CoinGecko failed:", e.message); }
@@ -87,7 +78,7 @@ app.get("/prices", async (_, res) => {
   res.status(500).json({ error: "All price sources failed" });
 });
 
-// ── POST /ai/analyze ───────────────────────────────────────────────────────────
+// ── POST /ai/analyze ──────────────────────────────────────────────────────────
 app.post("/ai/analyze", async (req, res) => {
   const { prompt, pair } = req.body;
   if (!prompt) return res.status(400).json({ error: "Missing prompt" });
@@ -120,7 +111,7 @@ app.post("/ai/analyze", async (req, res) => {
     const match = txt.match(/\{[\s\S]*?\}/);
     if (!match) throw new Error("No JSON in response");
     const sig = JSON.parse(match[0]);
-    console.log(`[AI] ${pair} ✅ ${sig.signal} ${sig.confidence}%`);
+    console.log(`[AI] ${pair || "?"} ${sig.signal} ${sig.confidence}%`);
     res.json(sig);
   } catch(e) {
     console.error("[AI] Error:", e.message);
@@ -128,20 +119,18 @@ app.post("/ai/analyze", async (req, res) => {
   }
 });
 
-// ── POST /weex/balance — try all domains + endpoints ─────────────────────────
+// ── POST /weex/balance ────────────────────────────────────────────────────────
 app.post("/weex/balance", async (req, res) => {
   const { key, secret } = req.body;
   if (!key || !secret) return res.status(400).json({ error: "Missing credentials" });
 
   const result = { spot: {}, futures: {}, debug: [] };
 
-  // All possible spot endpoint + domain combinations
   const spotCombos = [
     { domain: "www.weex.com", path: "/api/v1/account/balance" },
     { domain: "www.weex.com", path: "/api/spot/v1/account/balance" },
     { domain: "www.weex.com", path: "/spot/v1/account/balance" },
     { domain: "www.weex.com", path: "/api/v1/account/assets" },
-    { domain: "www.weex.com", path: "/api/user/v1/account/balance" },
     { domain: "www.weex.com", path: "/api/v2/account/balance" },
   ];
 
@@ -164,36 +153,32 @@ app.post("/weex/balance", async (req, res) => {
         },
       });
 
-      const log = `[Spot] ${domain}${path} → HTTP${r.status} code=${r.data?.code} msg=${r.data?.msg||"ok"}`;
-      console.log(log, JSON.stringify(r.data).slice(0, 400));
+      const log = `[Spot] ${domain}${path} HTTP${r.status} code=${r.data && r.data.code} msg=${r.data && r.data.msg}`;
+      console.log(log, JSON.stringify(r.data).slice(0, 300));
       result.debug.push(log);
 
       const d = r.data;
-      const success = d.code === "00000" || d.code === 0 || d.code === "0" || d.success === true || r.status === 200 && !d.code;
+      const ok = d.code === "00000" || d.code === 0 || d.code === "0" || d.success === true;
 
-      if (success) {
-        // Parse every possible balance format Weex might return
+      if (ok) {
         let list = [];
-        if (Array.isArray(d.data))              list = d.data;
-        else if (Array.isArray(d.result))       list = d.result;
-        else if (Array.isArray(d.balances))     list = d.balances;
-        else if (Array.isArray(d.list))         list = d.list;
-        else if (Array.isArray(d.assets))       list = d.assets;
+        if (Array.isArray(d.data))        list = d.data;
+        else if (Array.isArray(d.result)) list = d.result;
+        else if (Array.isArray(d.list))   list = d.list;
         else if (d.data && typeof d.data === "object") {
-          // Sometimes data is {USDT: {available: ...}, BTC: {...}}
           list = Object.entries(d.data).map(([k, v]) => ({ coinName: k, ...v }));
         }
 
         for (const a of list) {
-          const sym = (a.coinName || a.currency || a.asset || a.coin || a.symbol || "").toUpperCase();
-          if (["USDT","BTC","ETH","SOL","BNB","USDC"].includes(sym)) {
+          const sym = (a.coinName || a.currency || a.asset || a.coin || "").toUpperCase();
+          if (["USDT","BTC","ETH","SOL","BNB"].includes(sym)) {
             result.spot[sym] = {
-              available: parseFloat(a.available || a.availableBalance || a.free || a.balance || a.amount || 0).toFixed(sym==="USDT"?2:8),
-              locked:    parseFloat(a.locked    || a.freeze || a.used || a.frozenBalance || a.hold || 0).toFixed(sym==="USDT"?2:8),
+              available: parseFloat(a.available || a.availableBalance || a.free || 0).toFixed(sym === "USDT" ? 2 : 8),
+              locked:    parseFloat(a.locked    || a.freeze           || a.used || 0).toFixed(sym === "USDT" ? 2 : 8),
             };
           }
         }
-        console.log("[Spot] ✅ Parsed:", result.spot);
+        console.log("[Spot] Parsed:", result.spot);
         spotDone = true;
       }
     } catch(e) {
@@ -203,12 +188,10 @@ app.post("/weex/balance", async (req, res) => {
     }
   }
 
-  // Futures endpoints
   const futuresCombos = [
     { domain: "www.weex.com", path: "/api/v1/contract/account/balance" },
     { domain: "www.weex.com", path: "/api/mix/v1/account/accounts?productType=umcbl" },
     { domain: "www.weex.com", path: "/api/v1/future/account" },
-    { domain: "www.weex.com", path: "/mix/v1/account/accounts?productType=umcbl" },
     { domain: "www.weex.com", path: "/api/v2/contract/account/balance" },
   ];
 
@@ -231,28 +214,28 @@ app.post("/weex/balance", async (req, res) => {
         },
       });
 
-      const log = `[Futures] ${domain}${path} → HTTP${r.status} code=${r.data?.code} msg=${r.data?.msg||"ok"}`;
-      console.log(log, JSON.stringify(r.data).slice(0, 400));
+      const log = `[Futures] ${domain}${path} HTTP${r.status} code=${r.data && r.data.code}`;
+      console.log(log, JSON.stringify(r.data).slice(0, 300));
       result.debug.push(log);
 
       const d = r.data;
-      const success = d.code === "00000" || d.code === 0 || d.success === true || r.status === 200 && !d.code;
+      const ok = d.code === "00000" || d.code === 0 || d.success === true;
 
-      if (success) {
+      if (ok) {
         let list = [];
-        if (Array.isArray(d.data))          list = d.data;
-        else if (Array.isArray(d.result))   list = d.result;
+        if (Array.isArray(d.data))        list = d.data;
+        else if (Array.isArray(d.result)) list = d.result;
         else if (d.data && typeof d.data === "object") list = [d.data];
 
         for (const a of list) {
           const sym = (a.coinName || a.currency || a.marginCoin || a.asset || "USDT").toUpperCase();
           result.futures[sym] = {
-            available:  parseFloat(a.available || a.availableBalance || a.crossMaxAvailable || 0).toFixed(2),
-            unrealized: parseFloat(a.unrealizedPnl || a.unrealizedProfit || a.usdtEquity || 0).toFixed(2),
-            margin:     parseFloat(a.margin || a.positionMargin || 0).toFixed(2),
+            available:  parseFloat(a.available       || a.availableBalance || 0).toFixed(2),
+            unrealized: parseFloat(a.unrealizedPnl   || a.unrealizedProfit || 0).toFixed(2),
+            margin:     parseFloat(a.margin          || a.positionMargin   || 0).toFixed(2),
           };
         }
-        console.log("[Futures] ✅ Parsed:", result.futures);
+        console.log("[Futures] Parsed:", result.futures);
         futuresDone = true;
       }
     } catch(e) {
@@ -262,13 +245,13 @@ app.post("/weex/balance", async (req, res) => {
     }
   }
 
-  if (!spotDone)    result.spotError    = "No working endpoint found — check debug array";
+  if (!spotDone)    result.spotError    = "No working endpoint found";
   if (!futuresDone) result.futuresError = "No futures endpoint found";
 
   res.json(result);
 });
 
-// ── POST /weex/order ───────────────────────────────────────────────────────────
+// ── POST /weex/order ──────────────────────────────────────────────────────────
 app.post("/weex/order", async (req, res) => {
   const { key, secret, pair, side, qty } = req.body;
   if (!key || !secret || !pair || !side || !qty) {
@@ -278,30 +261,36 @@ app.post("/weex/order", async (req, res) => {
   const symbol  = pair.replace("/", "");
   const ts      = Date.now().toString();
   const path    = "/api/v1/order";
-  const bodyStr = JSON.stringify({
-    symbol,
-    side:     side.toUpperCase(),
-    type:     "MARKET",
-    quantity: qty.toString(),
-  });
-  const sig = weexSign(secret, ts, "POST", path, bodyStr);
+  const bodyStr = JSON.stringify({ symbol, side: side.toUpperCase(), type: "MARKET", quantity: qty.toString() });
+  const sig     = weexSign(secret, ts, "POST", path, bodyStr);
 
   try {
     const r = await httpsRequest({
       hostname: "www.weex.com",
+      path,
+      method:   "POST",
+      headers: {
+        "Content-Type":   "application/json",
+        "Content-Length": Buffer.byteLength(bodyStr),
+        "X-API-KEY":      key,
+        "X-TIMESTAMP":    ts,
+        "X-SIGNATURE":    sig,
+        "User-Agent":     "Mozilla/5.0",
+      },
+    }, bodyStr);
 
     const d = r.data;
     if (d.code && d.code !== "00000" && d.code !== 0) throw new Error(d.msg || JSON.stringify(d));
-    const orderId = d.data?.orderId || d.orderId || "ok_" + Date.now();
-    console.log(`[Weex Order] ✅ ${side} ${qty} ${symbol} → ${orderId}`);
+    const orderId = (d.data && d.data.orderId) || d.orderId || "ok_" + Date.now();
+    console.log(`[Order] ${side} ${qty} ${symbol} orderId=${orderId}`);
     res.json({ success: true, orderId, symbol, side, qty });
   } catch(e) {
-    console.error("[Weex Order]", e.message);
+    console.error("[Order] Error:", e.message);
     res.status(500).json({ error: e.message });
   }
 });
 
-// ── POST /weex/cancel ──────────────────────────────────────────────────────────
+// ── POST /weex/cancel ─────────────────────────────────────────────────────────
 app.post("/weex/cancel", async (req, res) => {
   const { key, secret, orderId } = req.body;
   if (!key || !secret || !orderId) return res.status(400).json({ error: "Missing params" });
@@ -312,7 +301,7 @@ app.post("/weex/cancel", async (req, res) => {
 
   try {
     const r = await httpsRequest({
-      hostname: "api.weex.com",
+      hostname: "www.weex.com",
       path,
       method:   "DELETE",
       headers: {
@@ -320,6 +309,7 @@ app.post("/weex/cancel", async (req, res) => {
         "X-API-KEY":    key,
         "X-TIMESTAMP":  ts,
         "X-SIGNATURE":  sig,
+        "User-Agent":   "Mozilla/5.0",
       },
     });
     res.json({ success: true, raw: r.data });
@@ -328,7 +318,19 @@ app.post("/weex/cancel", async (req, res) => {
   }
 });
 
-// ── Start ──────────────────────────────────────────────────────────────────────
+// ── DNS test ──────────────────────────────────────────────────────────────────
+app.get("/weex/dns-test", async (_, res) => {
+  const dns = require("dns").promises;
+  const domains = ["api.weex.com","openapi.weex.com","www.weex.com","api.weexgo.com"];
+  const results = {};
+  for (const d of domains) {
+    try { results[d] = await dns.lookup(d); }
+    catch(e) { results[d] = "FAILED: " + e.message; }
+  }
+  res.json(results);
+});
+
+// ── Start ─────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`
 ╔═══════════════════════════════════════════════════╗
@@ -343,6 +345,6 @@ app.listen(PORT, () => {
 ║  POST /weex/cancel        cancel order            ║
 ╚═══════════════════════════════════════════════════╝
 
-Anthropic API Key: ${process.env.ANTHROPIC_API_KEY ? "✅ Loaded" : "❌ Missing — add to .env"}
+Anthropic API Key: ${process.env.ANTHROPIC_API_KEY ? "✅ Loaded" : "❌ Missing"}
   `);
 });
