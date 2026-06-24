@@ -329,6 +329,48 @@ app.get("/weex/dns-test", async (_, res) => {
   }
   res.json(results);
 });
+// ── POST /weex/raw-test ───────────────────────────────────────────────────────
+app.post("/weex/raw-test", async (req, res) => {
+  const { key, secret } = req.body;
+  const paths = [
+    "/api/v1/account/balance",
+    "/api/spot/v1/account/balance", 
+    "/api/v1/account/assets",
+    "/api/v2/account/balance",
+    "/api/v1/asset/balance",
+  ];
+  const results = {};
+  for (const path of paths) {
+    try {
+      const ts  = Date.now().toString();
+      const sig = weexSign(secret, ts, "GET", path);
+      const raw = await new Promise((resolve, reject) => {
+        const req2 = https.request({
+          hostname: "www.weex.com",
+          path,
+          method: "GET",
+          headers: {
+            "Content-Type": "application/json",
+            "X-API-KEY":    key,
+            "X-TIMESTAMP":  ts,
+            "X-SIGNATURE":  sig,
+            "User-Agent":   "Mozilla/5.0",
+          },
+        }, (r) => {
+          let d = "";
+          r.on("data", c => d += c);
+          r.on("end", () => resolve({ status: r.statusCode, body: d.slice(0, 500) }));
+        });
+        req2.on("error", reject);
+        req2.end();
+      });
+      results[path] = raw;
+    } catch(e) {
+      results[path] = { error: e.message };
+    }
+  }
+  res.json(results);
+});
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
