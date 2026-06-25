@@ -203,72 +203,67 @@ app.post("/weex/balance", async (req, res) => {
     }
   }
 
-  // ── Futures — try Weex Mix API (correct futures endpoint) ──────────────────
-  // Weex futures uses /mix/v1/ endpoints, NOT /api/v3/
-  const futuresCombos = [
-    // Weex Mix API — this is the correct futures endpoint
-    { domain: "api.weex.com",         path: "/mix/v1/account/accounts?productType=umcbl", version: "v3" },
-    { domain: "api.weex.com",         path: "/mix/v1/account/accounts?productType=dmcbl", version: "v3" },
-    { domain: "api-futures.weex.com", path: "/mix/v1/account/accounts?productType=umcbl", version: "v3" },
-    // Fallback to old paths in case
-    { domain: "api-futures.weex.com", path: "/api/v3/account/balance",                    version: "v3" },
-    { domain: "api-spot.weex.com",    path: "/api/v3/futures/balance",                    version: "v3" },
-  ];
+  // ── Futures balance — official Weex Contract V3 API ──────────────────────
+  // Source: https://www.weex.com/api-doc/contract/Account_API/GetAccountBalance
+  // Domain:   api-contract.weex.com
+  // Endpoint: GET /capi/v3/account/balance
+  // Signature: timestamp + "GET" + "/capi/v3/account/balance" → HMAC-SHA256 → Base64
+  // Response fields: asset, balance, availableBalance, frozen, unrealizePnl
+  const fKey    = req.body.futuresKey    || key;
+  const fSecret = req.body.futuresSecret || secret;
+  const fPass   = req.body.futuresPassphrase || pass;
 
-  let futuresDone = false;
-  for (const { domain, path, version } of futuresCombos) {
-    if (futuresDone) break;
-    try {
-      const ts  = Date.now().toString();
-      // For mix API, path without query string is used for signing
-      const signPath = path.split("?")[0];
-      const queryStr = path.includes("?") ? "?" + path.split("?")[1] : "";
-      const sig = weexV3Sign(secret, ts, "GET", signPath + queryStr, "");
-      const r   = await httpsRaw({
-        hostname: domain, path, method: "GET",
-        headers: {
-          "Content-Type":      "application/json",
-          "ACCESS-KEY":        key,
-          "ACCESS-SIGN":       sig,
-          "ACCESS-TIMESTAMP":  ts,
-          "ACCESS-PASSPHRASE": pass,
-          "User-Agent":        "Mozilla/5.0",
-        },
-      });
-      const log = `[Futures] ${domain}${path} → HTTP${r.status} | ${r.body.slice(0,200)}`;
-      console.log(log);
-      result.debug.push(log);
+  try {
+    const ts      = Date.now().toString();
+    const fPath   = "/capi/v3/account/balance";
+    // Signature: timestamp + METHOD + requestPath (no queryString, no body for GET)
+    const fMsg    = ts + "GET" + fPath;
+    const fSig    = crypto.createHmac("sha256", fSecret).update(fMsg).digest("base64");
 
-      if (r.status === 200 && r.body.includes("{")) {
-        const d = JSON.parse(r.body);
-        // Mix API: code "00000" = success, data is array of account objects
-        const isSuccess = d.code === "00000" || d.code === 0 || d.requestTime;
-        if (isSuccess && d.data) {
-          let list = Array.isArray(d.data) ? d.data : [d.data];
-          for (const a of list) {
-            // Mix API field names: marginCoin, available, unrealizedPL, locked
-            const sym = (a.marginCoin || a.coinName || a.currency || a.asset || "USDT").toUpperCase();
-            result.futures[sym] = {
-              available:  parseFloat(a.available  || a.availableBalance || a.crossMaxAvailable || 0).toFixed(2),
-              unrealized: parseFloat(a.unrealizedPL || a.unrealizedPnl || a.unrealizedProfit   || 0).toFixed(2),
-              margin:     parseFloat(a.locked     || a.margin || a.positionMargin               || 0).toFixed(2),
-            };
-          }
-          if (Object.keys(result.futures).length > 0) {
-            console.log("[Futures] ✅", result.futures);
-            futuresDone = true;
-          } else {
-            console.log("[Futures] Response OK but no accounts found. Raw:", r.body.slice(0, 300));
-          }
+    const r = await httpsRaw({
+      hostname: "api-contract.weex.com",
+      path:     fPath,
+      method:   "GET",
+      headers: {
+        "Content-Type":      "application/json",
+        "ACCESS-KEY":        fKey,
+        "ACCESS-SIGN":       fSig,
+        "ACCESS-TIMESTAMP":  ts,
+        "ACCESS-PASSPHRASE": fPass,
+        "User-Agent":        "Mozilla/5.0",
+      },
+    });
+
+    const log = `[Futures] api-contract.weex.com${fPath} → HTTP${r.status} | ${r.body.slice(0, 300)}`;
+    console.log(log);
+    result.debug.push(log);
+
+    if (r.status === 200 && r.body.includes("[")) {
+      // Response is a direct array: [{asset, balance, availableBalance, frozen, unrealizePnl}]
+      const list = JSON.parse(r.body);
+      if (Array.isArray(list) && list.length > 0) {
+        for (const a of list) {
+          const sym = (a.asset || "USDT").toUpperCase();
+          result.futures[sym] = {
+            available:  parseFloat(a.availableBalance || 0).toFixed(2),
+            unrealized: parseFloat(a.unrealizePnl     || 0).toFixed(2),
+            margin:     parseFloat(a.frozen            || 0).toFixed(2),
+          };
         }
+        console.log("[Futures] ✅", result.futures);
+      } else {
+        result.debug.push("[Futures] Empty array returned — no futures balance yet");
       }
-    } catch(e) {
-      result.debug.push(`[Futures] ${e.message}`);
+    } else if (r.status === 200 && r.body.includes("{")) {
+      const d = JSON.parse(r.body);
+      result.debug.push(`[Futures] Unexpected response: code=${d.code} msg=${d.msg || d.message || ""}`);
     }
+  } catch(e) {
+    result.debug.push(`[Futures] ERROR: ${e.message}`);
   }
 
-  if (!spotDone)    result.spotError    = "No working endpoint — check debug";
-  if (!futuresDone) result.futuresError = "No futures endpoint found";
+    if (!spotDone)    result.spotError    = "No working endpoint — check debug";
+  if (!Object.keys(result.futures).length) result.futuresError = "No futures balance — check Logs tab";
 
   res.json(result);
 });
