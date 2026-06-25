@@ -203,12 +203,16 @@ app.post("/weex/balance", async (req, res) => {
     }
   }
 
-  // Futures
+  // ── Futures — try Weex Mix API (correct futures endpoint) ──────────────────
+  // Weex futures uses /mix/v1/ endpoints, NOT /api/v3/
   const futuresCombos = [
-    { domain: "api-futures.weex.com", path: "/api/v3/account/balance",  version: "v3" },
-    { domain: "api-futures.weex.com", path: "/api/v3/account",          version: "v3" },
-    { domain: "api-spot.weex.com",    path: "/api/v3/futures/balance",  version: "v3" },
-    { domain: "www.weex.com",         path: "/api/v3/futures/balance",  version: "v3" },
+    // Weex Mix API — this is the correct futures endpoint
+    { domain: "api.weex.com",         path: "/mix/v1/account/accounts?productType=umcbl", version: "v3" },
+    { domain: "api.weex.com",         path: "/mix/v1/account/accounts?productType=dmcbl", version: "v3" },
+    { domain: "api-futures.weex.com", path: "/mix/v1/account/accounts?productType=umcbl", version: "v3" },
+    // Fallback to old paths in case
+    { domain: "api-futures.weex.com", path: "/api/v3/account/balance",                    version: "v3" },
+    { domain: "api-spot.weex.com",    path: "/api/v3/futures/balance",                    version: "v3" },
   ];
 
   let futuresDone = false;
@@ -216,7 +220,10 @@ app.post("/weex/balance", async (req, res) => {
     if (futuresDone) break;
     try {
       const ts  = Date.now().toString();
-      const sig = weexV3Sign(secret, ts, "GET", path, "");
+      // For mix API, path without query string is used for signing
+      const signPath = path.split("?")[0];
+      const queryStr = path.includes("?") ? "?" + path.split("?")[1] : "";
+      const sig = weexV3Sign(secret, ts, "GET", signPath + queryStr, "");
       const r   = await httpsRaw({
         hostname: domain, path, method: "GET",
         headers: {
@@ -228,26 +235,30 @@ app.post("/weex/balance", async (req, res) => {
           "User-Agent":        "Mozilla/5.0",
         },
       });
-      const log = `[Futures] ${domain}${path} → HTTP${r.status} | ${r.body.slice(0,150)}`;
+      const log = `[Futures] ${domain}${path} → HTTP${r.status} | ${r.body.slice(0,200)}`;
       console.log(log);
       result.debug.push(log);
 
       if (r.status === 200 && r.body.includes("{")) {
         const d = JSON.parse(r.body);
-        const ok = d.code === "00000" || d.code === 0 || d.data;
-        if (ok) {
-          let list = Array.isArray(d.data) ? d.data : d.data ? [d.data] : [];
+        // Mix API: code "00000" = success, data is array of account objects
+        const isSuccess = d.code === "00000" || d.code === 0 || d.requestTime;
+        if (isSuccess && d.data) {
+          let list = Array.isArray(d.data) ? d.data : [d.data];
           for (const a of list) {
-            const sym = (a.coinName || a.currency || a.marginCoin || a.asset || "USDT").toUpperCase();
+            // Mix API field names: marginCoin, available, unrealizedPL, locked
+            const sym = (a.marginCoin || a.coinName || a.currency || a.asset || "USDT").toUpperCase();
             result.futures[sym] = {
-              available:  parseFloat(a.available || a.availableBalance || 0).toFixed(2),
-              unrealized: parseFloat(a.unrealizedPnl || a.unrealizedProfit || 0).toFixed(2),
-              margin:     parseFloat(a.margin || a.positionMargin || 0).toFixed(2),
+              available:  parseFloat(a.available  || a.availableBalance || a.crossMaxAvailable || 0).toFixed(2),
+              unrealized: parseFloat(a.unrealizedPL || a.unrealizedPnl || a.unrealizedProfit   || 0).toFixed(2),
+              margin:     parseFloat(a.locked     || a.margin || a.positionMargin               || 0).toFixed(2),
             };
           }
           if (Object.keys(result.futures).length > 0) {
             console.log("[Futures] ✅", result.futures);
             futuresDone = true;
+          } else {
+            console.log("[Futures] Response OK but no accounts found. Raw:", r.body.slice(0, 300));
           }
         }
       }
