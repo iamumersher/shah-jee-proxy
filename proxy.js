@@ -268,20 +268,41 @@ app.post("/weex/balance", async (req, res) => {
   res.json(result);
 });
 
-// ── POST /weex/order ──────────────────────────────────────────────────────────
+// ── POST /weex/order — Official Weex Contract V3 API ─────────────────────────
+// Source: https://www.weex.com/api-doc/contract/Transaction_API/PlaceOrder
+// Domain: api-contract.weex.com  Path: POST /capi/v3/order
 app.post("/weex/order", async (req, res) => {
   const { key, secret, passphrase, pair, side, qty } = req.body;
   if (!key || !secret || !pair || !side || !qty) return res.status(400).json({ error: "Missing params" });
 
-  const symbol  = pair.replace("/", "");
+  const symbol = pair.replace("/", "");
+  // positionSide: BUY=LONG, SELL=SHORT (for futures)
+  const positionSide = side.toUpperCase() === "BUY" ? "LONG" : "SHORT";
+  // quantity must be whole number of contracts (1 contract = 0.001 BTC for BTC, etc)
+  // Convert from coin amount to contracts: round to nearest integer, minimum 1
+  const contracts = Math.max(1, Math.round(parseFloat(qty)));
+  const clientOrderId = "sjbot-" + Date.now();
+
+  const path    = "/capi/v3/order";
+  const bodyObj = {
+    symbol,
+    side:             side.toUpperCase(),
+    positionSide,
+    type:             "MARKET",
+    quantity:         contracts.toString(),
+    newClientOrderId: clientOrderId,
+  };
+  const bodyStr = JSON.stringify(bodyObj);
   const ts      = Date.now().toString();
-  const path    = "/api/v3/order";
-  const bodyStr = JSON.stringify({ symbol, side: side.toUpperCase(), type: "MARKET", quantity: qty.toString() });
-  const sig     = weexV3Sign(secret, ts, "POST", path, bodyStr);
+  // Signature: timestamp + POST + /capi/v3/order + body
+  const msg     = ts + "POST" + path + bodyStr;
+  const sig     = crypto.createHmac("sha256", secret).update(msg).digest("base64");
+
+  console.log(`[Order] Sending: ${side} ${contracts} contracts of ${symbol} | body: ${bodyStr}`);
 
   try {
     const r = await httpsRequest({
-      hostname: "api-spot.weex.com", path, method: "POST",
+      hostname: "api-contract.weex.com", path, method: "POST",
       headers: {
         "Content-Type":      "application/json",
         "Content-Length":    Buffer.byteLength(bodyStr),
@@ -292,11 +313,14 @@ app.post("/weex/order", async (req, res) => {
         "User-Agent":        "Mozilla/5.0",
       },
     }, bodyStr);
+    console.log(`[Order] Response HTTP${r.status}:`, JSON.stringify(r.data));
     const d = r.data;
+    // success field in response
+    if (d && d.success === false) throw new Error(d.errorMessage || d.errorCode || JSON.stringify(d));
     if (d && d.code && d.code !== "00000" && d.code !== 0) throw new Error(d.msg || JSON.stringify(d));
-    const orderId = (d && d.data && d.data.orderId) || "ok_" + Date.now();
-    console.log(`[Order] ✅ ${side} ${qty} ${symbol} → ${orderId}`);
-    res.json({ success: true, orderId, symbol, side, qty });
+    const orderId = (d && d.orderId) || (d && d.data && d.data.orderId) || "ok_" + Date.now();
+    console.log(`[Order] ✅ ${side} ${contracts} contracts ${symbol} → orderId: ${orderId}`);
+    res.json({ success: true, orderId, symbol, side, qty: contracts });
   } catch(e) {
     console.error("[Order] Error:", e.message);
     res.status(500).json({ error: e.message });
