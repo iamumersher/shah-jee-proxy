@@ -10,28 +10,27 @@ const PORT = process.env.PORT || 4000;
 app.use(cors({ origin: "*" }));
 app.use(express.json());
 
-// ── HTTPS helpers ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// HTTPS HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
 function httpsGet(url) {
   return new Promise((resolve, reject) => {
     https.get(url, { headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" } }, (res) => {
       let data = "";
       res.on("data", c => data += c);
-      res.on("end", () => {
-        try { resolve(JSON.parse(data)); }
-        catch(e) { reject(new Error("Parse error: " + data.slice(0,100))); }
-      });
+      res.on("end", () => { try { resolve(JSON.parse(data)); } catch(e) { reject(new Error("Parse: " + data.slice(0,100))); } });
     }).on("error", reject);
   });
 }
 
-function httpsRequest(options, body) {
+function httpsReq(options, body) {
   return new Promise((resolve, reject) => {
     const req = https.request(options, (res) => {
       let data = "";
       res.on("data", c => data += c);
       res.on("end", () => {
         try { resolve({ status: res.statusCode, data: JSON.parse(data) }); }
-        catch(e) { resolve({ status: res.statusCode, raw: data.slice(0, 500) }); }
+        catch(e) { resolve({ status: res.statusCode, data: {}, raw: data.slice(0, 500) }); }
       });
     });
     req.on("error", reject);
@@ -45,7 +44,7 @@ function httpsRaw(options, body) {
     const req = https.request(options, (res) => {
       let data = "";
       res.on("data", c => data += c);
-      res.on("end", () => resolve({ status: res.statusCode, body: data.slice(0, 1000) }));
+      res.on("end", () => resolve({ status: res.statusCode, body: data }));
     });
     req.on("error", reject);
     if (body) req.write(body);
@@ -53,25 +52,34 @@ function httpsRaw(options, body) {
   });
 }
 
-// ── Weex V3 Signature ─────────────────────────────────────────────────────────
-// ACCESS-SIGN = Base64( HMAC-SHA256( timestamp + method + path + body, secret ) )
-function weexV3Sign(secret, timestamp, method, path, body) {
-  const msg = timestamp + method.toUpperCase() + path + (body || "");
+// ─────────────────────────────────────────────────────────────────────────────
+// WEEX SIGNATURE  (Base64 HMAC-SHA256)
+// Format: timestamp + METHOD + path + body
+// ─────────────────────────────────────────────────────────────────────────────
+function sign(secret, ts, method, path, body = "") {
+  const msg = ts + method.toUpperCase() + path + body;
   return crypto.createHmac("sha256", secret).update(msg).digest("base64");
 }
 
-// Weex V1 signature (old format — hex)
-function weexV1Sign(secret, timestamp, method, path, body) {
-  const msg = timestamp + method.toUpperCase() + path + (body || "");
-  return crypto.createHmac("sha256", secret).update(msg).digest("hex");
+function weexHeaders(key, secret, pass, ts, method, path, body = "") {
+  return {
+    "Content-Type":      "application/json",
+    "ACCESS-KEY":        key,
+    "ACCESS-SIGN":       sign(secret, ts, method, path, body),
+    "ACCESS-TIMESTAMP":  ts,
+    "ACCESS-PASSPHRASE": pass || "",
+    "User-Agent":        "Mozilla/5.0",
+  };
 }
 
-// ── GET /health ───────────────────────────────────────────────────────────────
-app.get("/health", (_, res) => {
-  res.json({ ok: true, ts: Date.now() });
-});
+// ─────────────────────────────────────────────────────────────────────────────
+// HEALTH
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/health", (_, res) => res.json({ ok: true, ts: Date.now() }));
 
-// ── GET /prices ───────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// PRICES  (Binance → CoinGecko fallback)
+// ─────────────────────────────────────────────────────────────────────────────
 app.get("/prices", async (_, res) => {
   try {
     const [a, b, c] = await Promise.all([
@@ -85,38 +93,47 @@ app.get("/prices", async (_, res) => {
       return res.json({ BTC: btc, ETH: eth, SOL: sol, source: "Binance" });
     }
   } catch(e) { console.warn("[Prices] Binance failed:", e.message); }
-
   try {
     const d = await httpsGet("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana&vs_currencies=usd");
     const btc = d.bitcoin?.usd, eth = d.ethereum?.usd, sol = d.solana?.usd;
     if (btc > 0) {
-      console.log(`[Prices] CoinGecko BTC=$${btc}`);
+      console.log(`[Prices] CoinGecko BTC=$${btc} ETH=$${eth} SOL=$${sol}`);
       return res.json({ BTC: btc, ETH: eth, SOL: sol, source: "CoinGecko" });
     }
   } catch(e) { console.warn("[Prices] CoinGecko failed:", e.message); }
-
   res.status(500).json({ error: "All price sources failed" });
 });
 
-// ── POST /ai/analyze ──────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// AI ANALYZE  (Claude via Anthropic API)
+// ─────────────────────────────────────────────────────────────────────────────
 app.post("/ai/analyze", async (req, res) => {
   const { prompt, pair } = req.body;
   if (!prompt) return res.status(400).json({ error: "Missing prompt" });
   const KEY = process.env.ANTHROPIC_API_KEY || "";
-  if (!KEY) return res.status(500).json({ error: "ANTHROPIC_API_KEY not in .env" });
-  const body = JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 400, messages: [{ role: "user", content: prompt }] });
+  if (!KEY) return res.status(500).json({ error: "ANTHROPIC_API_KEY not set in Railway env vars" });
+  const body = JSON.stringify({
+    model: "claude-sonnet-4-6",
+    max_tokens: 500,
+    messages: [{ role: "user", content: prompt }]
+  });
   try {
-    const result = await httpsRequest({
+    const r = await httpsReq({
       hostname: "api.anthropic.com", path: "/v1/messages", method: "POST",
-      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body), "x-api-key": KEY, "anthropic-version": "2023-06-01" },
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body),
+        "x-api-key": KEY,
+        "anthropic-version": "2023-06-01"
+      },
     }, body);
-    const d = result.data;
+    const d = r.data;
     if (d.error) throw new Error(d.error.message);
     const txt = (d.content || []).map(b => b.text || "").join("").trim();
     const match = txt.match(/\{[\s\S]*?\}/);
-    if (!match) throw new Error("No JSON in response");
+    if (!match) throw new Error("No JSON in AI response");
     const sig = JSON.parse(match[0]);
-    console.log(`[AI] ${pair || "?"} ${sig.signal} ${sig.confidence}%`);
+    console.log(`[AI] ${pair || "?"} → ${sig.signal} ${sig.confidence}% | ${sig.strategy}`);
     res.json(sig);
   } catch(e) {
     console.error("[AI] Error:", e.message);
@@ -124,252 +141,214 @@ app.post("/ai/analyze", async (req, res) => {
   }
 });
 
-// ── POST /weex/balance — V3 API with correct signature ────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// WEEX BALANCE  (Spot + Futures)
+// Spot:    api-spot.weex.com    GET /api/v3/account
+// Futures: api-contract.weex.com GET /capi/v3/account/balance
+// ─────────────────────────────────────────────────────────────────────────────
 app.post("/weex/balance", async (req, res) => {
   const { key, secret, passphrase } = req.body;
   if (!key || !secret) return res.status(400).json({ error: "Missing credentials" });
 
   const result = { spot: {}, futures: {}, debug: [] };
-  const pass = passphrase || "";
+  const pass   = passphrase || "";
 
-  // All endpoint combinations to try with both V3 and V1 signature
-  const combos = [
-    // THIS WORKS - confirmed HTTP200
-    { domain: "api-spot.weex.com", path: "/api/v3/account", version: "v3" },
-  ];
-
-  let spotDone = false;
-  for (const { domain, path, version } of combos) {
-    if (spotDone) break;
-    try {
-      const ts  = Date.now().toString();
-      const sig = version === "v3"
-        ? weexV3Sign(secret, ts, "GET", path, "")
-        : weexV1Sign(secret, ts, "GET", path, "");
-
-      const headers = version === "v3" ? {
-        "Content-Type":       "application/json",
-        "ACCESS-KEY":         key,
-        "ACCESS-SIGN":        sig,
-        "ACCESS-TIMESTAMP":   ts,
-        "ACCESS-PASSPHRASE":  pass,
-        "User-Agent":         "Mozilla/5.0",
-      } : {
-        "Content-Type": "application/json",
-        "X-API-KEY":    key,
-        "X-TIMESTAMP":  ts,
-        "X-SIGNATURE":  sig,
-        "User-Agent":   "Mozilla/5.0",
-      };
-
-      const r = await httpsRaw({ hostname: domain, path, method: "GET", headers });
-      const log = `[${version}] ${domain}${path} → HTTP${r.status} | ${r.body.slice(0,150)}`;
-      console.log(log);
-      result.debug.push(log);
-
-      if (r.status === 200 && r.body.includes("{")) {
-        try {
-          const d = JSON.parse(r.body);
-          // /api/v3/account returns balances array directly
-          let list = [];
-          if (Array.isArray(d.balances))    list = d.balances;
-          else if (Array.isArray(d.data))   list = d.data;
-          else if (Array.isArray(d.result)) list = d.result;
-          else if (Array.isArray(d.list))   list = d.list;
-          else if (d.data && typeof d.data === "object") {
-            list = Object.entries(d.data).map(([k, v]) => ({ coinName: k, ...v }));
-          }
-          for (const a of list) {
-            const sym = (a.asset || a.coinName || a.currency || a.coin || "").toUpperCase();
-            if (["USDT","BTC","ETH","SOL","BNB"].includes(sym)) {
-              result.spot[sym] = {
-                available: parseFloat(a.free || a.available || a.availableBalance || 0).toFixed(sym === "USDT" ? 2 : 8),
-                locked:    parseFloat(a.locked || a.freeze || a.used || 0).toFixed(sym === "USDT" ? 2 : 8),
-              };
-            }
-          }
-          if (Object.keys(result.spot).length > 0) {
-            console.log("[Spot] ✅ Parsed:", result.spot);
-            spotDone = true;
-          } else {
-            console.log("[Spot] Response parsed but no matching assets. Full response:", r.body.slice(0, 500));
-          }
-        } catch(pe) { console.warn("Parse error:", pe.message); }
-      }
-    } catch(e) {
-      const log = `[${version}] ${domain} ERROR: ${e.message}`;
-      console.warn(log);
-      result.debug.push(log);
-    }
-  }
-
-  // ── Futures balance — official Weex Contract V3 API ──────────────────────
-  // Source: https://www.weex.com/api-doc/contract/Account_API/GetAccountBalance
-  // Domain:   api-contract.weex.com
-  // Endpoint: GET /capi/v3/account/balance
-  // Signature: timestamp + "GET" + "/capi/v3/account/balance" → HMAC-SHA256 → Base64
-  // Response fields: asset, balance, availableBalance, frozen, unrealizePnl
-  const fKey    = req.body.futuresKey    || key;
-  const fSecret = req.body.futuresSecret || secret;
-  const fPass   = req.body.futuresPassphrase || pass;
-
+  // ── Spot Balance ────────────────────────────────────────────────────────────
   try {
-    const ts      = Date.now().toString();
-    const fPath   = "/capi/v3/account/balance";
-    // Signature: timestamp + METHOD + requestPath (no queryString, no body for GET)
-    const fMsg    = ts + "GET" + fPath;
-    const fSig    = crypto.createHmac("sha256", fSecret).update(fMsg).digest("base64");
-
-    const r = await httpsRaw({
-      hostname: "api-contract.weex.com",
-      path:     fPath,
-      method:   "GET",
-      headers: {
-        "Content-Type":      "application/json",
-        "ACCESS-KEY":        fKey,
-        "ACCESS-SIGN":       fSig,
-        "ACCESS-TIMESTAMP":  ts,
-        "ACCESS-PASSPHRASE": fPass,
-        "User-Agent":        "Mozilla/5.0",
-      },
+    const ts   = Date.now().toString();
+    const path = "/api/v3/account";
+    const r    = await httpsRaw({
+      hostname: "api-spot.weex.com", path, method: "GET",
+      headers: weexHeaders(key, secret, pass, ts, "GET", path),
     });
-
-    const log = `[Futures] api-contract.weex.com${fPath} → HTTP${r.status} | ${r.body.slice(0, 300)}`;
+    const log = `[Spot] api-spot.weex.com${path} → HTTP${r.status} | ${r.body.slice(0, 200)}`;
     console.log(log);
     result.debug.push(log);
 
-    if (r.status === 200 && r.body.includes("[")) {
-      // Response is a direct array: [{asset, balance, availableBalance, frozen, unrealizePnl}]
-      const list = JSON.parse(r.body);
-      if (Array.isArray(list) && list.length > 0) {
+    if (r.status === 200) {
+      const d = JSON.parse(r.body);
+      const list = Array.isArray(d.balances) ? d.balances
+                 : Array.isArray(d.data)     ? d.data
+                 : Array.isArray(d.result)   ? d.result : [];
+      for (const a of list) {
+        const sym = (a.asset || a.coinName || a.currency || "").toUpperCase();
+        if (["USDT","BTC","ETH","SOL"].includes(sym)) {
+          result.spot[sym] = {
+            available: parseFloat(a.free || a.available || a.availableBalance || 0).toFixed(sym === "USDT" ? 2 : 8),
+            locked:    parseFloat(a.locked || a.freeze || 0).toFixed(sym === "USDT" ? 2 : 8),
+          };
+        }
+      }
+      if (Object.keys(result.spot).length > 0) console.log("[Spot] ✅", result.spot);
+      else result.debug.push("[Spot] Parsed OK but no USDT/BTC/ETH/SOL found — spot wallet may be empty");
+    }
+  } catch(e) {
+    result.debug.push(`[Spot] ERROR: ${e.message}`);
+    result.spotError = e.message;
+  }
+
+  // ── Futures Balance (USDT-M) ─────────────────────────────────────────────────
+  // Official docs: https://www.weex.com/api-doc/contract/Account_API/GetAccountBalance
+  // GET /capi/v3/account/balance → returns array directly
+  // Fields: asset, balance, availableBalance, frozen, unrealizePnl
+  try {
+    const ts   = Date.now().toString();
+    const path = "/capi/v3/account/balance";
+    const r    = await httpsRaw({
+      hostname: "api-contract.weex.com", path, method: "GET",
+      headers: weexHeaders(key, secret, pass, ts, "GET", path),
+    });
+    const log = `[Futures] api-contract.weex.com${path} → HTTP${r.status} | ${r.body.slice(0, 300)}`;
+    console.log(log);
+    result.debug.push(log);
+
+    if (r.status === 200) {
+      const body = r.body.trim();
+      // Response is a direct JSON array
+      if (body.startsWith("[")) {
+        const list = JSON.parse(body);
         for (const a of list) {
           const sym = (a.asset || "USDT").toUpperCase();
           result.futures[sym] = {
             available:  parseFloat(a.availableBalance || 0).toFixed(2),
+            total:      parseFloat(a.balance          || 0).toFixed(2),
             unrealized: parseFloat(a.unrealizePnl     || 0).toFixed(2),
-            margin:     parseFloat(a.frozen            || 0).toFixed(2),
+            frozen:     parseFloat(a.frozen           || 0).toFixed(2),
           };
         }
-        console.log("[Futures] ✅", result.futures);
+        if (Object.keys(result.futures).length > 0) console.log("[Futures] ✅", result.futures);
+        else result.debug.push("[Futures] Empty array — no futures balance or account not activated");
       } else {
-        result.debug.push("[Futures] Empty array returned — no futures balance yet");
+        const d = JSON.parse(body);
+        result.debug.push(`[Futures] Got object not array: code=${d.code} msg=${d.msg || ""}`);
+        result.futuresError = d.msg || "Unexpected response format";
       }
-    } else if (r.status === 200 && r.body.includes("{")) {
-      const d = JSON.parse(r.body);
-      result.debug.push(`[Futures] Unexpected response: code=${d.code} msg=${d.msg || d.message || ""}`);
+    } else {
+      result.futuresError = `HTTP ${r.status}: ${r.body.slice(0, 100)}`;
     }
   } catch(e) {
     result.debug.push(`[Futures] ERROR: ${e.message}`);
+    result.futuresError = e.message;
   }
-
-    if (!spotDone)    result.spotError    = "No working endpoint — check debug";
-  if (!Object.keys(result.futures).length) result.futuresError = "No futures balance — check Logs tab";
 
   res.json(result);
 });
 
-// ── POST /weex/order — Official Weex Contract V3 API ─────────────────────────
-// Source: https://www.weex.com/api-doc/contract/Transaction_API/PlaceOrder
-// Domain: api-contract.weex.com  Path: POST /capi/v3/order
+// ─────────────────────────────────────────────────────────────────────────────
+// WEEX ORDER  (Futures USDT-M)
+// Official docs: https://www.weex.com/api-doc/contract/Transaction_API/PlaceOrder
+// POST /capi/v3/order on api-contract.weex.com
+// Required: symbol, side, positionSide, type, quantity, newClientOrderId
+// Contract sizes: BTCUSDT=0.001 BTC, ETHUSDT=0.01 ETH, SOLUSDT=0.1 SOL
+// ─────────────────────────────────────────────────────────────────────────────
 app.post("/weex/order", async (req, res) => {
-  const { key, secret, passphrase, pair, side, qty } = req.body;
-  if (!key || !secret || !pair || !side || !qty) return res.status(400).json({ error: "Missing params" });
+  const { key, secret, passphrase, pair, side, availableUSDT, price } = req.body;
+  if (!key || !secret || !pair || !side) return res.status(400).json({ error: "Missing params" });
 
-  const symbol = pair.replace("/", "");
-  // positionSide: BUY=LONG, SELL=SHORT (for futures)
-  const positionSide = side.toUpperCase() === "BUY" ? "LONG" : "SHORT";
-  // quantity must be whole number of contracts (1 contract = 0.001 BTC for BTC, etc)
-  // Convert from coin amount to contracts: round to nearest integer, minimum 1
-  const contracts = Math.max(1, Math.round(parseFloat(qty)));
-  const clientOrderId = "sjbot-" + Date.now();
+  const symbol   = pair.replace("/", "");
+  const posSide  = side.toUpperCase() === "BUY" ? "LONG" : "SHORT";
+  const pass     = passphrase || "";
+  const avail    = parseFloat(availableUSDT || 0);
+  const px       = parseFloat(price || 0);
 
-  const path    = "/capi/v3/order";
-  const bodyObj = {
+  // Contract sizes per Weex spec
+  const CS = { BTCUSDT: 0.001, ETHUSDT: 0.01, SOLUSDT: 0.1 };
+  const cs = CS[symbol] || 0.01;
+
+  // At 10x leverage: margin_per_contract = (cs * price) / 10
+  // How many contracts can we open with 10% of available balance?
+  let contracts = 1;
+  if (px > 0 && avail > 0) {
+    const leverage     = 10;
+    const marginPerCon = (cs * px) / leverage;
+    const useBalance   = avail * 0.1; // use max 10% of balance per trade
+    contracts = Math.max(1, Math.floor(useBalance / marginPerCon));
+  }
+
+  const clientId = "sjbot-" + Date.now();
+  const path     = "/capi/v3/order";
+  const bodyObj  = {
     symbol,
     side:             side.toUpperCase(),
-    positionSide,
+    positionSide:     posSide,
     type:             "MARKET",
     quantity:         contracts.toString(),
-    newClientOrderId: clientOrderId,
+    newClientOrderId: clientId,
   };
   const bodyStr = JSON.stringify(bodyObj);
   const ts      = Date.now().toString();
-  // Signature: timestamp + POST + /capi/v3/order + body
-  const msg     = ts + "POST" + path + bodyStr;
-  const sig     = crypto.createHmac("sha256", secret).update(msg).digest("base64");
 
-  console.log(`[Order] Sending: ${side} ${contracts} contracts of ${symbol} | body: ${bodyStr}`);
+  console.log(`[Order] ${side} ${contracts} contracts ${symbol} | avail=$${avail} price=$${px} margin/con=$${px>0?((cs*px)/10).toFixed(2):"?"}`);
 
   try {
-    const r = await httpsRequest({
+    const r = await httpsReq({
       hostname: "api-contract.weex.com", path, method: "POST",
       headers: {
-        "Content-Type":      "application/json",
-        "Content-Length":    Buffer.byteLength(bodyStr),
-        "ACCESS-KEY":        key,
-        "ACCESS-SIGN":       sig,
-        "ACCESS-TIMESTAMP":  ts,
-        "ACCESS-PASSPHRASE": passphrase || "",
-        "User-Agent":        "Mozilla/5.0",
+        ...weexHeaders(key, secret, pass, ts, "POST", path, bodyStr),
+        "Content-Length": Buffer.byteLength(bodyStr),
       },
     }, bodyStr);
     console.log(`[Order] Response HTTP${r.status}:`, JSON.stringify(r.data));
     const d = r.data;
-    // success field in response
-    if (d && d.success === false) throw new Error(d.errorMessage || d.errorCode || JSON.stringify(d));
-    if (d && d.code && d.code !== "00000" && d.code !== 0) throw new Error(d.msg || JSON.stringify(d));
-    const orderId = (d && d.orderId) || (d && d.data && d.data.orderId) || "ok_" + Date.now();
+    if (d.success === false) throw new Error(d.errorMessage || d.errorCode || JSON.stringify(d));
+    if (d.code && d.code !== "00000" && d.code !== 0) throw new Error(d.msg || JSON.stringify(d));
+    const orderId = d.orderId || (d.data && d.data.orderId) || "ok_" + Date.now();
     console.log(`[Order] ✅ ${side} ${contracts} contracts ${symbol} → orderId: ${orderId}`);
-    res.json({ success: true, orderId, symbol, side, qty: contracts });
+    res.json({ success: true, orderId, symbol, side, contracts });
   } catch(e) {
     console.error("[Order] Error:", e.message);
     res.status(500).json({ error: e.message });
   }
 });
 
-// ── POST /weex/cancel ─────────────────────────────────────────────────────────
-app.post("/weex/cancel", async (req, res) => {
-  const { key, secret, passphrase, orderId } = req.body;
-  if (!key || !secret || !orderId) return res.status(400).json({ error: "Missing params" });
-  const ts   = Date.now().toString();
-  const path = `/api/v3/order/${orderId}`;
-  const sig  = weexV3Sign(secret, ts, "DELETE", path, "");
+// ─────────────────────────────────────────────────────────────────────────────
+// EMERGENCY CLOSE ALL  (close every open position at market)
+// Official: POST /capi/v3/positions/close-all on api-contract.weex.com
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/weex/close", async (req, res) => {
+  const { key, secret, passphrase } = req.body;
+  if (!key || !secret) return res.status(400).json({ error: "Missing credentials" });
+
+  const pass    = passphrase || "";
+  const path    = "/capi/v3/positions/close-all";
+  const bodyStr = "{}";
+  const ts      = Date.now().toString();
+
+  console.log("[Close All] Closing all open positions...");
   try {
-    const r = await httpsRequest({
-      hostname: "api-spot.weex.com", path, method: "DELETE",
-      headers: { "Content-Type": "application/json", "ACCESS-KEY": key, "ACCESS-SIGN": sig, "ACCESS-TIMESTAMP": ts, "ACCESS-PASSPHRASE": passphrase || "", "User-Agent": "Mozilla/5.0" },
-    });
-    res.json({ success: true, raw: r.data });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── GET /weex/dns-test ────────────────────────────────────────────────────────
-app.get("/weex/dns-test", async (_, res) => {
-  const dns = require("dns").promises;
-  const domains = ["api-spot.weex.com","api-futures.weex.com","api.weex.com","www.weex.com","openapi.weex.com"];
-  const results = {};
-  for (const d of domains) {
-    try { results[d] = await dns.lookup(d); }
-    catch(e) { results[d] = "FAILED: " + e.message; }
+    const r = await httpsReq({
+      hostname: "api-contract.weex.com", path, method: "POST",
+      headers: {
+        ...weexHeaders(key, secret, pass, ts, "POST", path, bodyStr),
+        "Content-Length": Buffer.byteLength(bodyStr),
+      },
+    }, bodyStr);
+    console.log("[Close All] Response:", JSON.stringify(r.data));
+    const d = r.data;
+    if (d.code && d.code !== "00000" && d.code !== 0) throw new Error(d.msg || JSON.stringify(d));
+    res.json({ success: true, raw: d });
+  } catch(e) {
+    console.error("[Close All] Error:", e.message);
+    res.status(500).json({ error: e.message });
   }
-  res.json(results);
 });
 
-// ── Start ─────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// START
+// ─────────────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`
-╔═══════════════════════════════════════════════════╗
-║      Shah Jee Trading Bot — Proxy Running         ║
-║      http://localhost:${PORT}                        ║
-╠═══════════════════════════════════════════════════╣
-║  GET  /health             status check            ║
-║  GET  /prices             BTC / ETH / SOL         ║
-║  POST /ai/analyze         Claude AI signal        ║
-║  POST /weex/balance       spot + futures          ║
-║  POST /weex/order         place order             ║
-║  POST /weex/cancel        cancel order            ║
-║  GET  /weex/dns-test      DNS check               ║
-╚═══════════════════════════════════════════════════╝
-Anthropic API Key: ${process.env.ANTHROPIC_API_KEY ? "✅ Loaded" : "❌ Missing"}
-  `);
+╔══════════════════════════════════════════════════════╗
+║       Shah Jee Trading Bot — Proxy v2.0              ║
+╠══════════════════════════════════════════════════════╣
+║  GET  /health          → status check                ║
+║  GET  /prices          → BTC / ETH / SOL live        ║
+║  POST /ai/analyze      → Claude AI signal            ║
+║  POST /weex/balance    → spot + futures balance      ║
+║  POST /weex/order      → place futures order         ║
+║  POST /weex/close      → emergency close all         ║
+╚══════════════════════════════════════════════════════╝
+Anthropic Key: ${process.env.ANTHROPIC_API_KEY ? "✅ Loaded" : "❌ MISSING - set in Railway env vars"}
+Port: ${PORT}
+`);
 });
