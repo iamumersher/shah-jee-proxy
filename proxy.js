@@ -256,13 +256,28 @@ app.post("/weex/order", async (req, res) => {
   const cs = CS[symbol] || 0.01;
 
   // At 10x leverage: margin_per_contract = (cs * price) / 10
-  // How many contracts can we open with 10% of available balance?
-  let contracts = 1;
+  // Use 10% of available balance per trade, minimum 1 contract
+  // BUT verify we can actually afford it — Weex has minimum margin requirements
+  let contracts = 0;
   if (px > 0 && avail > 0) {
     const leverage     = 10;
     const marginPerCon = (cs * px) / leverage;
-    const useBalance   = avail * 0.1; // use max 10% of balance per trade
-    contracts = Math.max(1, Math.floor(useBalance / marginPerCon));
+    const useBalance   = avail * 0.10; // max 10% of balance per trade
+    contracts = Math.floor(useBalance / marginPerCon);
+    // Must be able to afford at least 1 contract
+    if (contracts < 1 && avail >= marginPerCon) contracts = 1;
+    if (contracts < 1) {
+      // Cannot afford even 1 contract of this pair
+      const needed = marginPerCon.toFixed(2);
+      return res.status(400).json({ 
+        error: `Insufficient balance: need $${needed} margin for 1 ${symbol} contract at 10x leverage, have $${avail.toFixed(2)} available.`,
+        needsMoreFunds: true,
+        marginNeeded: needed,
+        symbol
+      });
+    }
+  } else {
+    contracts = 1; // fallback
   }
 
   const clientId = "sjbot-" + Date.now();
@@ -310,7 +325,7 @@ app.post("/weex/close", async (req, res) => {
   if (!key || !secret) return res.status(400).json({ error: "Missing credentials" });
 
   const pass    = passphrase || "";
-  const path    = "/capi/v3/positions/close-all";
+  const path    = "/capi/v3/closePositions"; // Official: https://www.weex.com/api-doc/contract/Transaction_API/ClosePositions
   const bodyStr = "{}";
   const ts      = Date.now().toString();
 
